@@ -59,6 +59,8 @@ else:
     cache_disabled = False
 from flask import Flask, request, Response, stream_with_context, copy_current_request_context
 from flask_mysqldb import MySQL
+import psycopg2
+import psycopg2.extras
 from flask_cors import CORS
 
 ################################################################################
@@ -85,7 +87,6 @@ QUERY_DELIM = ","
 
 app = Flask(__name__)
 CORS(app)
-
 # Configure database connection
 app.config["MYSQL_HOST"] = config.DBHOST
 app.config["MYSQL_USER"] = config.DBUSER
@@ -94,7 +95,8 @@ app.config["MYSQL_DB"] = config.DBNAME
 app.config["MYSQL_PORT"] = config.DBPORT
 app.config["MYSQL_USE_UNICODE"] = True
 app.config["MYSQL_CURSORCLASS"] = "DictCursor"
-mysql = MySQL(app)
+if config.DBTYPE == "MYSQL":
+    mysql = MySQL(app)
 
 
 def main_handler(generator):
@@ -2314,7 +2316,16 @@ def lemgram_count(args):
 
     result = {}
     with app.app_context():
-        cursor = mysql.connection.cursor()
+        if (config["DBTYPE"] == "MYSQL"):
+            cursor = mysql.connection.cursor()
+        else: # Default is DBTYPE = "POSTGRESQL"
+            conn = psycopg2.connect(host=config.HOSTNAME,
+                                    user=config.DBUSER,
+                                    password=config.DBPASSWORD,
+                                    dbname=config.DBNAME)
+
+            conn.set_client_encoding('UTF8')
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
         cursor.execute(sql)
 
     for row in cursor:
@@ -2327,9 +2338,26 @@ def lemgram_count(args):
     yield result
 
 
+def postgres_escape_string(s):
+    if not isinstance(s, str):
+        raise TypeError("%r must be a str or unicode" % (s, ))
+    escaped = repr(s)
+    if isinstance(s, bytes):
+        assert escaped[:1] == 'u'
+        escaped = escaped[1:]
+    if escaped[:1] == '"':
+        escaped = escaped.replace("'", "\\'")
+    elif escaped[:1] != "'":
+        raise AssertionError("unexpected repr: %s", escaped)
+    return escaped
+
+
 def sql_escape(s):
     with app.app_context():
-        return mysql.connection.escape_string(s).decode("utf-8") if isinstance(s, str) else s
+        if config.DBTYPE == "MYSQL":
+            return mysql.connection.escape_string(s).decode("utf-8") if isinstance(s, str) else s
+        else:
+            return postgres_escape_string(s)
 
 
 ################################################################################
@@ -2366,6 +2394,9 @@ def timespan(args, no_combined_cache=False):
             raise ValueError("When using 'from' or 'to', both need to be specified.")
 
     shorten = {"y": 4, "m": 7, "d": 10, "h": 13, "n": 16, "s": 19}
+    pattern = {"y":"YYYY", "m":"YYYY-MM", "d":"YYYY-MM-DD", "h":"YYYY-MM-DD-HH24", "n":"YYYY-MM-DD-HH24-MI", "s":"YYYY-MM-DD-HH24-MI-SS"}
+    shorten2 = {"y": 4, "m": 6, "d": 8, "h": 10, "n": 12, "s": 14}
+    pattern2 = {"y":"YYYY", "m":"YYYYMM", "d":"YYYYMMDD", "h":"YYYYMMDDHH24", "n":"YYYYMMDDHH24MI", "s":"YYYYMMDDHH24MISS"}
 
     cached_data = []
     corpora_rest = corpora[:]
@@ -2403,23 +2434,29 @@ def timespan(args, no_combined_cache=False):
 
     with app.app_context():
         if corpora_rest:
-            corpora_sql = "(%s)" % ", ".join("'%s'" % sql_escape(c) for c in corpora_rest)
             fromto = ""
+            # corpora_sql = "(%s"
+            # corpora = ", ".join("'%s'" % c for c in corpora_rest)
+            query_data = [tuple(corpora_rest)]
 
             if strategy == 1:
                 if fromdate and todate:
-                    fromto = " AND ((datefrom >= %s AND dateto <= %s) OR (datefrom <= %s AND dateto >= %s))" % (
-                        sql_escape(fromdate), sql_escape(todate), sql_escape(fromdate), sql_escape(todate))
+                    fromto = " AND (datefrom >= to_date(%s, '"+pattern2[granularity]+"') AND dateto <= to_date(%s, '"+pattern2[granularity]+"')) OR (datefrom <= to_date(%s, '"+pattern2[granularity]+"') AND dateto >= to_date(%s, '"+pattern2[granularity]+"'))"
+                    query_data.extend([fromdate[:shorten2[granularity]], todate[:shorten2[granularity]], fromdate[:shorten2[granularity]], todate[:shorten2[granularity]]])
             elif strategy == 2:
                 if todate:
-                    fromto += " AND datefrom <= '%s'" % sql_escape(todate)
+                    fromto += " AND datefrom <= '%s'"
+                    query_data.append(todate)
                 if fromdate:
-                    fromto = " AND dateto >= '%s'" % sql_escape(fromdate)
+                    fromto = " AND dateto >= '%s'"
+                    query_data.append(fromdate)
             elif strategy == 3:
                 if fromdate:
-                    fromto = " AND datefrom >= '%s'" % sql_escape(fromdate)
+                    fromto = " AND datefrom >= '%s'"
+                    query_data.append(fromdate)
                 if todate:
-                    fromto += " AND dateto <= '%s'" % sql_escape(todate)
+                    fromto += " AND dateto <= '%s'"
+                    query_data.append(todate)
 
             # TODO: Skip grouping on corpus when we only are after the combined results.
             # We do the granularity truncation and summation in the DB query if we can (depending on strategy),
@@ -2429,13 +2466,26 @@ def timespan(args, no_combined_cache=False):
             if strategy == 1:
                 # We need the full dates for this strategy, so no truncating of the results
                 sql = "SELECT corpus, datefrom AS df, dateto AS dt, SUM(tokens) AS sum FROM " + timedata_corpus + \
-                      " WHERE corpus IN " + corpora_sql + fromto + " GROUP BY corpus, df, dt ORDER BY NULL;"
+                      " WHERE corpus IN %s" + fromto + " GROUP BY corpus, df, dt;"
             else:
                 sql = "SELECT corpus, LEFT(datefrom, " + str(shorten[granularity]) + ") AS df, LEFT(dateto, " + \
                       str(shorten[granularity]) + ") AS dt, SUM(tokens) AS sum FROM " + timedata_corpus + \
-                      " WHERE corpus IN " + corpora_sql + fromto + " GROUP BY corpus, df, dt ORDER BY NULL;"
-            cursor = mysql.connection.cursor()
-            cursor.execute(sql)
+                      " WHERE corpus IN %s" + fromto + " GROUP BY corpus, df, dt;"
+
+            if (config.DBTYPE == "MYSQL"):
+                cursor = mysql.connection.cursor()
+                cursor.execute(sql, query_data)
+            else:
+                conn = psycopg2.connect(host=config.HOSTNAME,
+                                        user=config.DBUSER,
+                                        password=config.DBPASSWORD,
+                                        dbname=config.DBNAME)
+
+                conn.set_client_encoding('UTF8')
+                cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+                cursor.execute(sql, tuple(query_data))
+            print(cursor.rowcount)
+
         else:
             cursor = tuple()
 
@@ -2606,8 +2656,7 @@ def timespan_calculator(timedata, granularity="y", combined=True, per_corpus=Tru
 
             if not datefrom_short == dateto_short:
                 continue
-
-        r = {"datefrom": datefrom_short, "dateto": dateto_short, "corpus": corpus, "freq": int(row["sum"])}
+        r = {"datefrom": datefrom_short, "dateto": dateto_short, "corpus": corpus, "freq": int(row["sum"] or 0)}
         if combined:
             rows["__combined__"].append(r)
             nodes["__combined__"].add(("f", datefrom_short))
@@ -3440,8 +3489,8 @@ if config.MEMCACHED_SERVERS and not cache_disabled:
             print("Could not connect to Memcached. Caching will be disabled.")
             cache_disabled = True
 
-# Set up caching
-setup_cache()
+    # Set up caching
+    setup_cache()
 
 if __name__ == "__main__":
     if len(sys.argv) == 2 and sys.argv[1] == "dev":

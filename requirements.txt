@@ -1,6 +1,7 @@
 Flask==1.0
 Flask-Cors==3.0.4
 Flask-MySQLdb==0.2.0
+psycopg2==2.7.4
 gevent==1.2.2
 Markdown==2.6.11
 pylibmc==1.5.2
