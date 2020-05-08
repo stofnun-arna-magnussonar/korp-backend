@@ -26,7 +26,7 @@ reload(subprocess)
 
 from concurrent import futures
 from concurrent.futures import ThreadPoolExecutor
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from dateutil.relativedelta import relativedelta
 from copy import deepcopy
 import datetime
@@ -48,7 +48,6 @@ import traceback
 import functools
 import math
 import random
-import markdown
 import config
 try:
     import pylibmc
@@ -67,10 +66,7 @@ from flask_cors import CORS
 # Nothing needs to be changed in this file. Use config.py for configuration.
 
 # The version of this script
-KORP_VERSION = "7.1.0"
-
-# URL for Språkbanken's Korp API (used for examples in documentation)
-SB_API_URL = "https://ws.spraakbanken.gu.se/ws/korp/v7/"
+KORP_VERSION = "8.0.1"
 
 # Special symbols used by this script; they must NOT be in the corpus
 END_OF_LINE = "-::-EOL-::-"
@@ -166,7 +162,7 @@ def main_handler(generator):
                     yield ")"
 
             def full_json(ff):
-                """Yield full JSON at end, but keep returning newlines to prevent timeout."""
+                """Yield full JSON at the end, but until then keep returning newlines to prevent timeout."""
                 result = {}
 
                 try:
@@ -260,7 +256,7 @@ def parse_corpora(args):
 
 
 def parse_within(args):
-    within = defaultdict(lambda: args.get("default_within", args.get("defaultwithin")))
+    within = defaultdict(lambda: args.get("default_within"))
 
     if args.get("within"):
         if ":" not in args.get("within"):
@@ -291,20 +287,11 @@ def sleep(args):
         yield {"%d" % x: x}
 
 
+@app.route("/")
 @app.route("/info", methods=["GET", "POST"])
 @main_handler
 def info(args):
-    """Return information, either about a specific corpus
-    or general information about the available corpora.
-    """
-    if args.get("corpus"):
-        yield corpus_info(args)
-    else:
-        yield general_info(args)
-
-
-def general_info(args):
-    """Return information about the available corpora."""
+    """Get version information about list of available corpora."""
     if args["cache"]:
         with mc_pool.reserve() as mc:
             result = mc.get("%s:info" % cache_prefix())
@@ -312,7 +299,8 @@ def general_info(args):
             if "debug" in args:
                 result.setdefault("DEBUG", {})
                 result["DEBUG"]["cache_read"] = True
-            return result
+            yield result
+            return
 
     corpora = run_cqp("show corpora;")
     version = next(corpora)
@@ -322,7 +310,7 @@ def general_info(args):
         with open(config.PROTECTED_FILE) as infile:
             protected = [x.strip() for x in infile.readlines()]
 
-    result = {"version": KORP_VERSION, "cqp-version": version, "corpora": list(corpora), "protected_corpora": protected}
+    result = {"version": KORP_VERSION, "cqp_version": version, "corpora": list(corpora), "protected_corpora": protected}
 
     if args["cache"]:
         with mc_pool.reserve() as mc:
@@ -331,11 +319,13 @@ def general_info(args):
             result.setdefault("DEBUG", {})
             result["DEBUG"]["cache_saved"] = True
 
-    return result
+    yield result
 
 
+@app.route("/corpus_info", methods=["GET", "POST"])
+@main_handler
 def corpus_info(args, no_combined_cache=False):
-    """Return information about a specific corpus or corpora."""
+    """Get information about a specific corpus or corpora."""
     assert_key("corpus", args, IS_IDENT, True)
 
     corpora = parse_corpora(args)
@@ -352,7 +342,8 @@ def corpus_info(args, no_combined_cache=False):
                 result.setdefault("DEBUG", {})
                 result["DEBUG"]["cache_read"] = True
                 result["DEBUG"]["checksum"] = checksum_combined
-            return result
+            yield result
+            return
 
     result = {"corpora": {}}
     total_size = 0
@@ -386,7 +377,9 @@ def corpus_info(args, no_combined_cache=False):
     for corpus in corpora:
         if corpus in result["corpora"]:
             total_size += int(result["corpora"][corpus]["info"]["Size"])
-            total_sentences += int(result["corpora"][corpus]["info"].get("Sentences", 0))
+            sentences = result["corpora"][corpus]["info"].get("Sentences", "")
+            if sentences.isdigit():
+                total_sentences += int(sentences)
             continue
 
         # Read attributes
@@ -426,8 +419,7 @@ def corpus_info(args, no_combined_cache=False):
                 if saved and "debug" in args:
                     result.setdefault("DEBUG", {})
                     result["DEBUG"]["cache_saved"] = True
-
-    return result
+    yield result
 
 
 ################################################################################
@@ -506,7 +498,7 @@ def query(args):
     within = parse_within(args)
 
     # Parse "context"/"left_context"/"right_context"/"default_context"
-    default_context = args.get("default_context", args.get("defaultcontext")) or "10 words"
+    default_context = args.get("default_context") or "10 words"
     context = defaultdict(lambda: (default_context,))
     contexts = {}
 
@@ -566,7 +558,7 @@ def query(args):
     statistics = {}
 
     saved_statistics = {}
-    query_data = args.get("query_data", args.get("querydata"))
+    query_data = args.get("query_data")
 
     if query_data:
         try:
@@ -731,7 +723,6 @@ def query(args):
     result["query_data"] = binascii.b2a_base64(zlib.compress(
         bytes(checksum + ";" + ";".join("%s:%d" % (c, h) for c, h in statistics.items()),
               "utf-8"))).decode("utf-8").replace("+", "-").replace("/", "_")
-    result["querydata"] = result["query_data"]  # For backward compatibility
 
     if debug:
         result["DEBUG"] = debug
@@ -1095,7 +1086,7 @@ def query_parse_lines(corpus, lines, attrs, show, show_structs, free_matches=Fal
         words = line.split()
         tokens = []
         n = 0
-        structs = defaultdict(list)
+        structs = {}
         struct = None
         struct_value = []
 
@@ -1109,7 +1100,9 @@ def query_parse_lines(corpus, lines, attrs, show, show_structs, free_matches=Fal
                         continue
 
                     struct_v, word = word.split(">", 1)
-                    structs["open"].append(struct + " " + " ".join(struct_value + [struct_v]))
+                    struct_tag, struct_attr = struct.split("_", 1)
+                    structs.setdefault("open", OrderedDict()).setdefault(struct_tag, {})
+                    structs["open"][struct_tag][struct_attr] = " ".join(struct_value + [struct_v])
                     struct = None
                     struct_value = []
 
@@ -1131,7 +1124,7 @@ def query_parse_lines(corpus, lines, attrs, show, show_structs, free_matches=Fal
                     elif ">" in word and word[1:word.find(">")] in s_attrs:
                         # We have found a structural attribute without a value (<s>)
                         struct, word = word[1:].split(">", 1)
-                        structs["open"].append(struct)
+                        structs.setdefault("open", OrderedDict()).setdefault(struct, {})
                         struct = None
                     else:
                         # What we've found is not a structural attribute
@@ -1150,15 +1143,21 @@ def query_parse_lines(corpus, lines, attrs, show, show_structs, free_matches=Fal
                         break
                     elif struct in s_attrs:
                         word = tempword
-                        structs["close"].insert(0, struct)
+                        structs.setdefault("close", [])
+                        struct = struct.split("_")[0]
+                        if not struct in structs["close"]:
+                            structs["close"].insert(0, struct)
                         struct = None
 
                 # What's left is the word with its p-attrs
                 values = word.rsplit("/", nr_splits)
                 token = dict((attr, translate_undef(val)) for (attr, val) in zip(p_attrs, values))
                 if structs:
+                    # Convert OrderedDict into list
+                    if "open" in structs:
+                        structs["open"] = [{k: structs["open"][k]} for k in structs["open"]]
                     token["structs"] = structs
-                    structs = defaultdict(list)
+                    structs = {}
                 tokens.append(token)
 
                 n += 1
@@ -1408,11 +1407,11 @@ def count(args):
     corpora = parse_corpora(args)
     check_authentication(corpora)
 
-    group_by = args.get("group_by", args.get("groupby")) or []
+    group_by = args.get("group_by") or []
     if isinstance(group_by, str):
         group_by = sorted(set(group_by.split(QUERY_DELIM)))
 
-    group_by_struct = args.get("group_by_struct", args.get("groupby_struct")) or []
+    group_by_struct = args.get("group_by_struct") or []
     if isinstance(group_by_struct, str):
         group_by_struct = sorted(set(group_by_struct.split(QUERY_DELIM)))
 
@@ -1495,8 +1494,7 @@ def count(args):
         if "debug" in args:
             debug["cache_coverage"] = "%d/%d" % (read_from_cache, len(corpora))
 
-    total_stats = [{"absolute": defaultdict(int),
-                    "relative": defaultdict(float),
+    total_stats = [{"rows": defaultdict(lambda: {"absolute": 0, "relative": 0.0}),
                     "sums": {"absolute": 0, "relative": 0.0}} for i in range(len(subcqp) + 1)]
 
     ns = Namespace()  # To make variables writable from nested functions
@@ -1511,14 +1509,14 @@ def count(args):
         }
 
         relative_to_result = generator_to_dict(count(relative_args))
-        relative_to_freqs = {"total": {}, "corpora": defaultdict(dict)}
+        relative_to_freqs = {"combined": {}, "corpora": defaultdict(dict)}
 
-        for row in relative_to_result["total"]["absolute"]:
-            relative_to_freqs["total"][tuple(v for k, v in sorted(row["value"].items()))] = row["freq"]
+        for row in relative_to_result["combined"]["rows"]:
+            relative_to_freqs["combined"][tuple(v for k, v in sorted(row["value"].items()))] = row["absolute"]
 
         for corpus in relative_to_result["corpora"]:
-            for row in relative_to_result["corpora"][corpus]["absolute"]:
-                relative_to_freqs["corpora"][corpus][tuple(v for k, v in sorted(row["value"].items()))] = row["freq"]
+            for row in relative_to_result["corpora"][corpus]["rows"]:
+                relative_to_freqs["corpora"][corpus][tuple(v for k, v in sorted(row["value"].items()))] = row["absolute"]
 
     count_function = count_query_worker if not simple else count_query_worker_simple
 
@@ -1527,8 +1525,7 @@ def count(args):
         yield {"progress_corpora": list(c for c in corpora if c not in zero_hits)}
 
     for corpus in zero_hits:
-        result["corpora"][corpus] = [{"absolute": {},
-                                      "relative": {},
+        result["corpora"][corpus] = [{"rows": {},
                                       "sums": {"absolute": 0, "relative": 0.0}} for i in range(len(subcqp) + 1)]
         for i in range(len(subcqp)):
             result["corpora"][corpus][i + 1]["cqp"] = subcqp[i]
@@ -1548,8 +1545,7 @@ def count(args):
                 lines, nr_hits, corpus_size = future.result()
 
                 ns.total_size += corpus_size
-                corpus_stats = [{"absolute": defaultdict(int),
-                                 "relative": defaultdict(float),
+                corpus_stats = [{"rows": defaultdict(lambda: {"absolute": 0, "relative": 0.0}),
                                  "sums": {"absolute": 0, "relative": 0.0}} for i in range(len(subcqp) + 1)]
 
                 query_no = 0
@@ -1607,21 +1603,21 @@ def count(args):
                     cross = list(itertools.product(*all_ngrams))
 
                     for ngram in cross:
-                        corpus_stats[query_no]["absolute"][ngram] += int(freq)
+                        corpus_stats[query_no]["rows"][ngram]["absolute"] += int(freq)
                         corpus_stats[query_no]["sums"]["absolute"] += int(freq)
-                        total_stats[query_no]["absolute"][ngram] += int(freq)
+                        total_stats[query_no]["rows"][ngram]["absolute"] += int(freq)
                         total_stats[query_no]["sums"]["absolute"] += int(freq)
 
                         if relative_to:
                             relativeto_ngram = tuple(ngram[pos] for pos in relative_to_pos)
-                            corpus_stats[query_no]["relative"][ngram] += int(freq) / float(
+                            corpus_stats[query_no]["rows"][ngram]["relative"] += int(freq) / float(
                                 relative_to_freqs["corpora"][corpus][relativeto_ngram]) * 1000000
                             corpus_stats[query_no]["sums"]["relative"] += int(freq) / float(
                                 relative_to_freqs["corpora"][corpus][relativeto_ngram]) * 1000000
-                            total_stats[query_no]["relative"][ngram] += int(freq) / float(
-                                relative_to_freqs["total"][relativeto_ngram]) * 1000000
+                            total_stats[query_no]["rows"][ngram]["relative"] += int(freq) / float(
+                                relative_to_freqs["combined"][relativeto_ngram]) * 1000000
                         else:
-                            corpus_stats[query_no]["relative"][ngram] += int(freq) / float(corpus_size) * 1000000
+                            corpus_stats[query_no]["rows"][ngram]["relative"] += int(freq) / float(corpus_size) * 1000000
                             corpus_stats[query_no]["sums"]["relative"] += int(freq) / float(corpus_size) * 1000000
 
                 result["corpora"][corpus] = corpus_stats
@@ -1630,33 +1626,31 @@ def count(args):
                     yield {"progress_%d" % ns.progress_count: corpus}
                     ns.progress_count += 1
 
-    result["count"] = len(total_stats[0]["absolute"])
+    result["count"] = len(total_stats[0]["rows"])
 
     # Calculate relative numbers for the total
     for query_no in range(len(subcqp) + 1):
-        if end > -1 and (start > 0 or len(total_stats[0]["absolute"]) > (end - start) + 1):
+        if end > -1 and (start > 0 or len(total_stats[0]["rows"]) > (end - start) + 1):
             # Only a selected range of results requested
-            total_stats[query_no]["absolute"] = dict(
-                sorted(total_stats[query_no]["absolute"].items(), key=lambda x: x[1], reverse=True)[start:end + 1])
+            total_stats[query_no]["rows"] = dict(
+                sorted(total_stats[query_no]["rows"].items(), key=lambda x: x[1]["absolute"],
+                       reverse=True)[start:end + 1])
 
             for corpus in corpora:
-                result["corpora"][corpus][query_no]["absolute"] = {k: v for k, v in result["corpora"][corpus][query_no][
-                    "absolute"].items() if k in total_stats[query_no]["absolute"]}
-                result["corpora"][corpus][query_no]["relative"] = {k: v for k, v in result["corpora"][corpus][query_no][
-                    "relative"].items() if k in total_stats[query_no]["absolute"]}
+                result["corpora"][corpus][query_no]["rows"] = {k: v for k, v in result["corpora"][corpus][query_no][
+                    "rows"].items() if k in total_stats[query_no]["rows"]}
 
         if not relative_to:
-            for ngram, freq in total_stats[query_no]["absolute"].items():
-                total_stats[query_no]["relative"][ngram] = freq / float(ns.total_size) * 1000000
+            for ngram, vals in total_stats[query_no]["rows"].items():
+                total_stats[query_no]["rows"][ngram]["relative"] = vals["absolute"] / float(ns.total_size) * 1000000
 
         for corpus in corpora:
-            for relabs in ("absolute", "relative"):
-                new_list = []
-                for ngram, freq in result["corpora"][corpus][query_no][relabs].items():
-                    row = {"value": {key[0]: ngram[i] for i, key in enumerate(group_by)},
-                           "freq": freq}
-                    new_list.append(row)
-                result["corpora"][corpus][query_no][relabs] = new_list
+            new_list = []
+            for ngram, vals in result["corpora"][corpus][query_no]["rows"].items():
+                row = {"value": {key[0]: ngram[i] for i, key in enumerate(group_by)}}
+                row.update(vals)
+                new_list.append(row)
+            result["corpora"][corpus][query_no]["rows"] = new_list
 
         total_stats[query_no]["sums"]["relative"] = (total_stats[query_no]["sums"]["absolute"] / float(ns.total_size)
                                                      * 1000000 if ns.total_size > 0 else 0.0)
@@ -1664,15 +1658,14 @@ def count(args):
         if subcqp and query_no > 0:
             total_stats[query_no]["cqp"] = subcqp[query_no - 1]
 
-        for relabs in ("absolute", "relative"):
-            new_list = []
-            for ngram, freq in total_stats[query_no][relabs].items():
-                row = {"value": dict((key[0], ngram[i]) for i, key in enumerate(group_by)),
-                       "freq": freq}
-                new_list.append(row)
-            total_stats[query_no][relabs] = new_list
+        new_list = []
+        for ngram, vals in total_stats[query_no]["rows"].items():
+            row = {"value": dict((key[0], ngram[i]) for i, key in enumerate(group_by))}
+            row.update(vals)
+            new_list.append(row)
+        total_stats[query_no]["rows"] = new_list
 
-    result["total"] = total_stats if len(total_stats) > 1 else total_stats[0]
+    result["combined"] = total_stats if len(total_stats) > 1 else total_stats[0]
 
     if not subcqp:
         for corpus in corpora:
@@ -1691,7 +1684,7 @@ def count(args):
 def count_all(args):
     """Like /count but for every single value of the given attributes."""
     assert_key("corpus", args, IS_IDENT, True)
-    assert_key(("group_by", "group_by_struct", "groupby"), args, IS_IDENT, True)
+    assert_key(("group_by", "group_by_struct"), args, IS_IDENT, True)
     assert_key("cut", args, IS_NUMBER)
     assert_key("ignore_case", args, IS_IDENT)
     assert_key("incremental", args, r"(true|false)")
@@ -1760,8 +1753,12 @@ def count_time(args):
         if not fromdate or not todate:
             raise ValueError("When using 'from' or 'to', both need to be specified.")
 
+    result = {"corpora": {}}
+    if "debug" in args:
+        result["DEBUG"] = {"cqp": cqp}
+
     # Get date range of selected corpora
-    corpus_data = corpus_info({"corpus": QUERY_DELIM.join(corpora), "cache": args["cache"]}, no_combined_cache=True)
+    corpus_data = generator_to_dict(corpus_info({"corpus": QUERY_DELIM.join(corpora), "cache": args["cache"]}, no_combined_cache=True))
     corpora_copy = corpora.copy()
 
     if fromdate and todate:
@@ -1819,7 +1816,29 @@ def count_time(args):
     else:
         group_by = [(v, True) for v in ("text_datefrom", "text_dateto")]
 
-    result = {"corpora": {}}
+    # Add zero values for the corpora we removed because of the selected date span
+    for corpus in set(corpora_copy).difference(set(corpora)):
+        result["corpora"][corpus] = [{"absolute": 0, "relative": 0.0, "sums": {"absolute": 0, "relative": 0.0}}
+                                     for i in range(len(subcqp) + 1)]
+        for i, c in enumerate(result["corpora"][corpus][1:]):
+            c["cqp"] = subcqp[i]
+
+        if not subcqp:
+            result["corpora"][corpus] = result["corpora"][corpus][0]
+
+    # Add zero values for the combined results if no corpora are within the selected date span
+    if not corpora:
+        result["combined"] = [{"absolute": 0, "relative": 0.0, "sums": {"absolute": 0, "relative": 0.0}}
+                              for i in range(len(subcqp) + 1)]
+        for i, c in enumerate(result["combined"][1:]):
+            c["cqp"] = subcqp[i]
+
+        if not subcqp:
+            result["combined"] = result["combined"][0]
+
+        yield result
+        return
+
     corpora_sizes = {}
 
     ns = Namespace()
@@ -1895,7 +1914,6 @@ def count_time(args):
                           for date in corpus_timedata["corpora"].get(corpus, {})])
 
         for i, s in enumerate(search_timedata):
-
             prevdate = None
             for basedate in sorted(basedates):
                 if not basedates[basedate] == prevdate:
@@ -1925,7 +1943,6 @@ def count_time(args):
                       for date in corpus_timedata.get("combined", {})])
 
     for i, s in enumerate(search_timedata_combined):
-
         prevdate = None
         for basedate in sorted(basedates):
             if not basedates[basedate] == prevdate:
@@ -1950,13 +1967,6 @@ def count_time(args):
 
     result["combined"] = total_stats if len(total_stats) > 1 else total_stats[0]
 
-    # Add zero values for the corpora we removed because of the selected date span
-    for corpus in set(corpora_copy).difference(set(corpora)):
-        result["corpora"][corpus] = {"absolute": 0, "relative": 0.0, "sums": {"absolute": 0, "relative": 0.0}}
-
-    if "debug" in args:
-        result["DEBUG"] = {"cqp": cqp}
-
     yield result
 
 
@@ -1969,6 +1979,7 @@ def count_query_worker(corpus, cqp, group_by, within, ignore_case=[], cut=None, 
 
     if use_cache:
         checksum = get_hash((cqp,
+                             subcqp,
                              group_by,
                              within,
                              sorted(ignore_case),
@@ -2014,7 +2025,7 @@ def count_query_worker(corpus, cqp, group_by, within, ignore_case=[], cut=None, 
     has_target = any("@[" in x for x in cqp)
 
     cmd += ["""tabulate Last %s > "| sort | uniq -c | sort -nr";""" % ", ".join("%s %s%s" % (
-        "target" if has_target else ("match" if g[1] else "match .. matchend"), g[0], " %c" if g in ignore_case else "") for g in group_by)]
+        "target" if has_target else ("match" if g[1] else "match .. matchend"), g[0], " %c" if g[0] in ignore_case else "") for g in group_by)]
 
     if subcqp:
         cmd += ["mainresult=Last;"]
@@ -2200,7 +2211,8 @@ def loglike(args):
     assert_key("set2_cqp", args, r"", True)
     assert_key("set1_corpus", args, r"", True)
     assert_key("set2_corpus", args, r"", True)
-    assert_key(("group_by", "group_by_struct", "groupby"), args, IS_IDENT, True)
+    assert_key("group_by", args, IS_IDENT, False)
+    assert_key("group_by_struct", args, IS_IDENT, False)
     assert_key("ignore_case", args, IS_IDENT)
     assert_key("max", args, IS_NUMBER, False)
 
@@ -2235,13 +2247,13 @@ def loglike(args):
                 if len(cset) == 1:
                     sets[i]["freq"] = dict((tuple(
                         (y[0], y[1] if isinstance(y[1], tuple) else (y[1],)) for y in sorted(x["value"].items())),
-                                            x["freq"])
-                                           for x in count_result["corpora"][corpus]["absolute"])
+                                            x["absolute"])
+                                           for x in count_result["corpora"][corpus]["rows"])
                 else:
                     for w, f in ((tuple(
                             (y[0], y[1] if isinstance(y[1], tuple) else (y[1],)) for y in sorted(x["value"].items())),
-                                  x["freq"])
-                                 for x in count_result["corpora"][corpus]["absolute"]):
+                                  x["absolute"])
+                                 for x in count_result["corpora"][corpus]["rows"]):
                         sets[i]["freq"][w] += f
 
     else:
@@ -2254,10 +2266,10 @@ def loglike(args):
 
         sets = [{}, {}]
         for i, cset in enumerate((set1, set2)):
-            sets[i]["total"] = count_result[i]["total"]["sums"]["absolute"]
+            sets[i]["total"] = count_result[i]["combined"]["sums"]["absolute"]
             sets[i]["freq"] = dict((tuple(
-                (y[0], y[1] if isinstance(y[1], tuple) else (y[1],)) for y in sorted(x["value"].items())), x["freq"])
-                                   for x in count_result[i]["total"]["absolute"])
+                (y[0], y[1] if isinstance(y[1], tuple) else (y[1],)) for y in sorted(x["value"].items())), x["absolute"])
+                                   for x in count_result[i]["combined"]["rows"])
 
     ll_list = compute_list(sets[0]["freq"], sets[0]["total"], sets[1]["freq"], sets[1]["total"])
     (ws, avg, mi, ma) = compute_ll_stats(ll_list, maxresults, sets)
@@ -2547,41 +2559,6 @@ def timespan_calculator(timedata, granularity="y", combined=True, per_corpus=Tru
 
     gs = {"y": 4, "m": 6, "d": 8, "h": 10, "n": 12, "s": 14}
 
-    def strftime(dt, fmt):
-        """Python datetime.strftime < 1900 workaround, taken from https://gist.github.com/2000837"""
-
-        TEMPYEAR = 9996  # We need to use a leap year to support feb 29th
-
-        if dt.year < 1900:
-            # Create a copy of this datetime, just in case, then set the year to
-            # something acceptable, then replace that year in the resulting string
-            tmp_dt = datetime.datetime(TEMPYEAR, dt.month, dt.day,
-                                       dt.hour, dt.minute,
-                                       dt.second, dt.microsecond,
-                                       dt.tzinfo)
-
-            tmp_fmt = fmt
-            tmp_fmt = re.sub('(?<!%)((?:%%)*)(%y)', '\\1\x11\x11', tmp_fmt, re.U)
-            tmp_fmt = re.sub('(?<!%)((?:%%)*)(%Y)', '\\1\x12\x12\x12\x12', tmp_fmt, re.U)
-            tmp_fmt = tmp_fmt.replace(str(TEMPYEAR), '\x13\x13\x13\x13')
-            tmp_fmt = tmp_fmt.replace(str(TEMPYEAR)[-2:], '\x14\x14')
-
-            result = tmp_dt.strftime(tmp_fmt)
-
-            if '%c' in fmt:
-                # Local datetime format - uses full year but hard for us to guess where.
-                result = result.replace(str(TEMPYEAR), str(dt.year))
-
-            result = result.replace('\x11\x11', str(dt.year)[-2:])
-            result = result.replace('\x12\x12\x12\x12', str(dt.year))
-            result = result.replace('\x13\x13\x13\x13', str(TEMPYEAR))
-            result = result.replace('\x14\x14', str(TEMPYEAR)[-2:])
-
-            return result
-
-        else:
-            return dt.strftime(fmt)
-
     def plusminusone(date, value, df, negative=False):
         date = "0" + date if len(date) % 2 else date  # Handle years with three digits
         d = strptime(date)
@@ -2589,7 +2566,7 @@ def timespan_calculator(timedata, granularity="y", combined=True, per_corpus=Tru
             d = d - value
         else:
             d = d + value
-        return int(strftime(d, df))
+        return int(d.strftime(df))
 
     def shorten(date, g):
         alt = 1 if len(date) % 2 else 0  # Handle years with three digits
@@ -2943,7 +2920,7 @@ def relations_sentences(args):
         shown_structs = shown_structs.split(QUERY_DELIM)
     shown_structs = set(shown_structs)
 
-    default_context = args.get("default_context", args.get("defaultcontext")) or "1 sentence"
+    default_context = args.get("default_context") or "1 sentence"
 
     querystarttime = time.time()
 
@@ -3086,9 +3063,10 @@ def cache_handler(args):
                             os.remove(cachefile)
                             result["files_removed"] += 1
 
-            # If any corpus has been updated or added, increase version to invalidate all combined caches
-            if result["corpora_invalidated"]:
+            # If any corpus has been updated, added or removed, increase version to invalidate all combined caches
+            if result["corpora_invalidated"] or not mc.get("multi:corpora", set()) == set(corpora.keys()):
                 mc.set("multi:version", mc.get("multi:version", 0) + 1)
+                mc.set("multi:corpora", set(corpora.keys()))
                 result["multi_invalidated"] = True
 
         # Remove old query data
@@ -3124,66 +3102,18 @@ def setup_cache():
         action_needed = True
 
     # Set up Memcached if needed
-    with mc_pool.reserve() as mc:
-        if "multi:version" not in mc:
-            corpora = get_corpus_timestamps()
-            mc.set("multi:version", 1)
-            for corpus in corpora:
-                mc.set("%s:version" % corpus, 1)
-                mc.set("%s:last_update" % corpus, corpora[corpus])
-            action_needed = True
+    if config.MEMCACHED_SERVERS:
+        with mc_pool.reserve() as mc:
+            if "multi:version" not in mc:
+                corpora = get_corpus_timestamps()
+                mc.set("multi:version", 1)
+                mc.set("multi:corpora", set(corpora.keys()))
+                for corpus in corpora:
+                    mc.set("%s:version" % corpus, 1)
+                    mc.set("%s:last_update" % corpus, corpora[corpus])
+                action_needed = True
 
     return action_needed
-
-
-################################################################################
-# DOCUMENTATION
-################################################################################
-
-@app.route("/")
-def documentation():
-    """Render API documentation."""
-    if not os.path.isfile("docs/api.md"):
-        return "API documentation missing."
-    with open("docs/api.md", encoding="UTF-8") as doc:
-        md_text = doc.read()
-
-    # Replace placeholders
-    md_text = md_text.replace("[SBURL]", SB_API_URL)
-    md_text = md_text.replace("[VERSION]", KORP_VERSION)
-
-    # Convert Markdown to HTML
-    md = markdown.Markdown(extensions=["markdown.extensions.toc",
-                                       "markdown.extensions.smarty",
-                                       "markdown.extensions.def_list"])
-    md_html = md.convert(md_text)
-    md_html = md_html.replace("<pre><code>", '<pre><code class="json">')
-
-    html = ["""<!doctype html>
-        <html>
-          <head>
-            <meta charset="utf-8">
-            <title>Korp API v%s</title>
-            <link href="//cdnjs.cloudflare.com/ajax/libs/highlight.js/9.12.0/styles/monokai-sublime.min.css"
-              rel="stylesheet">
-            <script src="//cdnjs.cloudflare.com/ajax/libs/highlight.js/9.12.0/highlight.min.js"></script>
-            <script>hljs.initHighlightingOnLoad();</script>
-            <link href="https://fonts.googleapis.com/css?family=Roboto" rel="stylesheet">
-            <link href="https://fonts.googleapis.com/css?family=Roboto+Slab" rel="stylesheet">
-            <link href="static/api.css" rel="stylesheet">
-          </head>
-          <body>
-            <div class="toc-wrapper">
-              <div class="header">
-                <img src="static/raven.png"><br>
-                Korp API <span>v%s</span>
-              </div>
-              %s
-            </div>
-           <div class="content">
-            """ % (KORP_VERSION, KORP_VERSION, md.toc), md_html, "</div></body></html>"]
-
-    return "\n".join(html)
 
 
 ################################################################################
@@ -3280,7 +3210,7 @@ def make_query(cqp):
 
 
 def translate_undef(s):
-    """Translate None to '__UNDEF__'."""
+    """Translate '__UNDEF__' to None."""
     return None if s == "__UNDEF__" else s
 
 
