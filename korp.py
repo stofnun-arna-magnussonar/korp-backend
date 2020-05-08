@@ -3499,5 +3499,6 @@ if __name__ == "__main__":
     else:
         # Run using gevent
         print("Serving using gevent")
-        http = WSGIServer((config.WSGI_HOST, config.WSGI_PORT), app.wsgi_app)
+        http = WSGIServer((config.WSGI_HOST, config.WSGI_PORT), app.wsgi_app, keyfile='/etc/letsencrypt/live/malheildir.arnastofnun.is-0001/privkey.pem', certfile='/etc/letsencrypt/live/malheildir.arnastofnun.is-0001/fullchain.pem')
+        #http = WSGIServer((config.WSGI_HOST, config.WSGI_PORT), app.wsgi_app)
         http.serve_forever()
