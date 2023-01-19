@@ -9,6 +9,8 @@ from pymemcache.exceptions import MemcacheError
 from korp import utils
 from korp.db import mysql
 from korp.memcached import memcached
+import psycopg2
+import psycopg2.extras
 
 bp = Blueprint("timespan", __name__)
 
@@ -17,6 +19,7 @@ bp = Blueprint("timespan", __name__)
 @utils.main_handler
 @utils.prevent_timeout
 def timespan(args, no_combined_cache=False):
+
     """Calculate timespan information for corpora.
     The time information is retrieved from the database.
     """
@@ -38,7 +41,9 @@ def timespan(args, no_combined_cache=False):
     fromdate = args.get("from")
     todate = args.get("to")
 
+
     if fromdate or todate:
+
         if not fromdate or not todate:
             raise ValueError("When using 'from' or 'to', both need to be specified.")
 
@@ -48,6 +53,7 @@ def timespan(args, no_combined_cache=False):
     corpora_rest = corpora[:]
 
     if args["cache"]:
+
         # Check if whole query is cached
         combined_checksum = utils.get_hash((granularity,
                                            combined,
@@ -80,8 +86,19 @@ def timespan(args, no_combined_cache=False):
     ns = {}
 
     if corpora_rest:
+
         corpora_sql = "(%s)" % ", ".join("'%s'" % utils.sql_escape(c) for c in corpora_rest)
+
         fromto = ""
+
+
+        if app.config["DBTYPE"]=="postgres":
+            if fromdate:
+                fromdate = utils.adapt_datetime(fromdate)
+            if todate:
+                todate = utils.adapt_datetime(todate)
+
+
 
         if strategy == 1:
             if fromdate and todate:
@@ -102,11 +119,13 @@ def timespan(args, no_combined_cache=False):
             if todate:
                 fromto += " AND dateto <= '%s'" % utils.sql_escape(todate)
 
+
         # TODO: Skip grouping on corpus when we only are after the combined results.
         # We do the granularity truncation and summation in the DB query if we can (depending on strategy),
         # since it's much faster than doing it afterwards
 
         timedata_corpus = "timedata_date" if granularity in ("y", "m", "d") else "timedata"
+
         if strategy == 1:
             # We need the full dates for this strategy, so no truncating of the results
             sql = "SELECT corpus, datefrom AS df, dateto AS dt, SUM(tokens) AS sum FROM " + timedata_corpus + \
@@ -115,12 +134,30 @@ def timespan(args, no_combined_cache=False):
             sql = "SELECT corpus, LEFT(datefrom, " + str(shorten[granularity]) + ") AS df, LEFT(dateto, " + \
                   str(shorten[granularity]) + ") AS dt, SUM(tokens) AS sum FROM " + timedata_corpus + \
                   " WHERE corpus IN " + corpora_sql + fromto + " GROUP BY corpus, df, dt ORDER BY NULL;"
-        cursor = mysql.connection.cursor()
+
+        if app.config["DBTYPE"]=="postgres":
+            sql = sql.replace(" ORDER BY NULL","").replace("''","'")
+
+
+            conn = psycopg2.connect(host=app.config["DBHOST"],
+                                    user=app.config["DBUSER"],
+                                    password=app.config["DBPASSWORD"],
+                                    dbname=app.config["DBNAME"])
+
+            conn.set_client_encoding('UTF8')
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+
+
+        else:
+            cursor = mysql.connection.cursor()
+
         cursor.execute(sql)
+
     else:
         cursor = tuple()
 
     if args["cache"]:
+
         def save_cache(mc, corpus, data):
             corpus_checksum = utils.get_hash((fromdate, todate, granularity, strategy))
             cache_key = "%s:timespan_%s" % (cache_prefixes[corpus], corpus_checksum)
@@ -161,6 +198,7 @@ def timespan(args, no_combined_cache=False):
 
 
 def timespan_calculator(timedata, granularity="y", combined=True, per_corpus=True, strategy=1):
+
     """Calculate timespan information for corpora.
 
     The required parameters are

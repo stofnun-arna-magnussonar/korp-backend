@@ -397,15 +397,15 @@ def count_time(args):
     if fromdate and todate:
         df = utils.strptime(fromdate)
         dt = utils.strptime(todate)
-
         # Remove corpora not within selected date span
         for c in corpus_data["corpora"]:
             firstdate = corpus_data["corpora"][c]["info"].get("FirstDate")
             lastdate = corpus_data["corpora"][c]["info"].get("LastDate")
             if firstdate and lastdate:
+                firstdate = utils.fix_date(firstdate)
+                lastdate = utils.fix_date(lastdate)
                 firstdate = utils.strptime(firstdate.replace("-", "").replace(":", "").replace(" ", ""))
                 lastdate = utils.strptime(lastdate.replace("-", "").replace(":", "").replace(" ", ""))
-
                 if not (firstdate <= dt and lastdate >= df):
                     corpora.remove(c)
     else:

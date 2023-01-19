@@ -7,7 +7,7 @@ from flask_cors import CORS
 
 from korp import utils
 from korp.cwb import cwb
-from korp.db import mysql
+#from korp.db import mysql
 from korp.memcached import memcached
 
 # The version of this script
@@ -51,7 +51,7 @@ def create_app():
         MYSQL_CURSORCLASS="DictCursor",
     )
 
-    mysql.init_app(app)
+    #mysql.init_app(app)
 
     # Set up Memcached
     if app.config["MEMCACHED_SERVER"]:
