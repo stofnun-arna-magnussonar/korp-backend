@@ -21,7 +21,7 @@ from gevent.queue import Queue, Empty
 from gevent.threadpool import ThreadPool
 from gevent.event import Event
 
-from korp.db import mysql
+#from korp.db import mysql
 from korp.memcached import memcached
 
 # Special symbols used by this script; they must NOT be in the corpus
@@ -607,8 +607,47 @@ def strptime(date):
 
 
 def sql_escape(s):
-    return mysql.connection.escape_string(s).decode("utf-8") if isinstance(s, str) else s
+    #return mysql.connection.escape_string(s).decode("utf-8") if isinstance(s, str) else s
 
+    if app.config["DBTYPE"]=="postgres":
+        return postgres_escape_string(s)
+    else:
+        return mysql.connection.escape_string(s).decode("utf-8") if isinstance(s, str) else s
+
+
+def postgres_escape_string(s):
+    if not isinstance(s, str):
+        raise TypeError("%r must be a str or unicode" % (s, ))
+    escaped = repr(s)
+    if isinstance(s, bytes):
+        assert escaped[:1] == 'u'
+        escaped = escaped[1:]
+    if escaped[:1] == '"':
+        escaped = escaped.replace("'", "\\'")
+    elif escaped[:1] != "'":
+        raise AssertionError("unexpected repr: %s", escaped)
+    return escaped
+
+#add space between date and time for postgres
+def adapt_datetime(dt):
+    if app.config["DBTYPE"]=="postgres":
+        return "{} {}".format(dt[0:8], dt[8:14]).strip()
+    else:
+        return dt
+#add month and day if missing:
+
+def fix_date(dt):
+
+    if len(dt)==19:
+        return dt
+
+    splt = dt.split(" ")
+    date = splt[0]
+    time = splt[1]
+    if len(date)==4:
+        date = "{}-01-01".format(date)
+
+    return "{} {}".format(date, time)
 
 class Plugin(Blueprint):
     """Simple plugin class, identical to Flask's Blueprint but with a method for accessing the plugin's
