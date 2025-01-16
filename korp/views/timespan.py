@@ -9,6 +9,8 @@ from pymemcache.exceptions import MemcacheError
 from korp import utils
 from korp.db import mysql
 from korp.memcached import memcached
+import psycopg2
+import psycopg2.extras
 
 bp = Blueprint("timespan", __name__)
 
@@ -83,6 +85,12 @@ def timespan(args, no_combined_cache=False):
         corpora_sql = "(%s)" % ", ".join("'%s'" % utils.sql_escape(c) for c in corpora_rest)
         fromto = ""
 
+        if app.config["DBTYPE"]=="postgres":
+            if fromdate:
+                fromdate = utils.adapt_datetime(fromdate)
+            if todate:
+                todate = utils.adapt_datetime(todate)
+
         if strategy == 1:
             if fromdate and todate:
                 fromto = (
@@ -115,7 +123,24 @@ def timespan(args, no_combined_cache=False):
             sql = "SELECT corpus, LEFT(datefrom, " + str(shorten[granularity]) + ") AS df, LEFT(dateto, " + \
                   str(shorten[granularity]) + ") AS dt, SUM(tokens) AS sum FROM " + timedata_corpus + \
                   " WHERE corpus IN " + corpora_sql + fromto + " GROUP BY corpus, df, dt ORDER BY NULL;"
-        cursor = mysql.connection.cursor()
+        #cursor = mysql.connection.cursor()
+
+        if app.config["DBTYPE"]=="postgres":
+            sql = sql.replace(" ORDER BY NULL","").replace("''","'")
+
+
+            conn = psycopg2.connect(host=app.config["DBHOST"],
+                                    user=app.config["DBUSER"],
+                                    password=app.config["DBPASSWORD"],
+                                    dbname=app.config["DBNAME"])
+
+            conn.set_client_encoding('UTF8')
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+
+
+        else:
+            cursor = mysql.connection.cursor()
+            
         cursor.execute(sql)
     else:
         cursor = tuple()
