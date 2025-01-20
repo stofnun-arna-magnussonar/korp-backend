@@ -9,11 +9,11 @@ WSGI_HOST = "0.0.0.0"
 WSGI_PORT = 1234
 
 # The absolute path to the CQP binaries
-CQP_EXECUTABLE = ""
-CWB_SCAN_EXECUTABLE = ""
+CQP_EXECUTABLE = "/usr/local/cwb-3.4.33/bin/cqp"
+CWB_SCAN_EXECUTABLE = "/usr/local/cwb-3.4.33/bin/cwb-scan-corpus"
 
 # The absolute path to the CWB registry files
-CWB_REGISTRY = ""
+CWB_REGISTRY = "/mnt/gagnageymsla/corpora/registry/"
 
 # The default encoding for the cqp binary
 CQP_ENCODING = "UTF-8"
